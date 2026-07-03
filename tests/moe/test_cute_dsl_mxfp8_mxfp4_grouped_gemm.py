@@ -218,7 +218,17 @@ class TestMxfp8Mxfp4CanImplement:
             Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel,
         )
 
-        def can_implement(*, k=128, a_dtype=None, b_dtype=None, sf_dtype=None, vec=32):
+        def can_implement(
+            *,
+            k=128,
+            n=256,
+            mma_tiler_mn=(128, 128),
+            a_dtype=None,
+            b_dtype=None,
+            sf_dtype=None,
+            vec=32,
+        ):
+            cluster_shape_mn = (2 if mma_tiler_mn[0] == 256 else 1, 1)
             return (
                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
                     a_dtype or cutlass.Float8E4M3FN,
@@ -227,10 +237,10 @@ class TestMxfp8Mxfp4CanImplement:
                     vec,
                     cutlass.BFloat16,
                     cutlass.Float32,
-                    (128, 128),
-                    (1, 1),
+                    mma_tiler_mn,
+                    cluster_shape_mn,
                     128,
-                    256,
+                    n,
                     k,
                     4,
                     a_major="k",
@@ -246,11 +256,168 @@ class TestMxfp8Mxfp4CanImplement:
         assert not can_implement(sf_dtype=cutlass.Float8E4M3FN)
         assert not can_implement(vec=16)
         assert not can_implement(k=64)
+        for mma_tiler_mn, n in [
+            ((128, 64), 128),
+            ((128, 192), 384),
+            ((256, 64), 128),
+            ((256, 192), 384),
+        ]:
+            assert can_implement(mma_tiler_mn=mma_tiler_mn, n=n)
+
+        # The 128x4 E8M0 scale layout requires complete 128-row groups.
+        assert not can_implement(mma_tiler_mn=(128, 64), n=192)
+        # The finalize epilogue bulk-reduces a complete N tile without a tail
+        # predicate, so a partial final tile would write past the output row.
+        assert not can_implement(mma_tiler_mn=(128, 192), n=256)
+
+        def can_implement_nvfp4(*, n, mma_tiler_mn):
+            return (
+                Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
+                    cutlass.Float4E2M1FN,
+                    cutlass.Float4E2M1FN,
+                    cutlass.Float8E4M3FN,
+                    16,
+                    cutlass.BFloat16,
+                    cutlass.Float32,
+                    mma_tiler_mn,
+                    (1, 1),
+                    128,
+                    n,
+                    128,
+                    4,
+                    a_major="k",
+                    b_major="k",
+                    out_major="n",
+                )
+            )
+
+        # The full-N bulk-reduce contract is shared by NVFP4 and mixed mode.
+        assert can_implement_nvfp4(n=384, mma_tiler_mn=(128, 192))
+        assert not can_implement_nvfp4(n=256, mma_tiler_mn=(128, 192))
+        assert not can_implement_nvfp4(n=128, mma_tiler_mn=(128, 256))
 
 
 @cute_dsl_available
 @sm100_required
 class TestMxfp8Mxfp4TwoStageMoe:
+    @pytest.mark.parametrize(
+        "mma_tiler_mn,cluster_shape_mn,n",
+        [
+            pytest.param((128, 64), (1, 1), 128, id="1cta-n64"),
+            pytest.param((128, 192), (1, 1), 384, id="1cta-n192"),
+            pytest.param((256, 64), (2, 1), 128, id="2cta-n64"),
+            pytest.param((256, 192), (2, 1), 384, id="2cta-n192"),
+        ],
+    )
+    def test_gemm2_finalize_tile_n_variants(self, mma_tiler_mn, cluster_shape_mn, n):
+        """Exercise the N=64/192 SFB offset paths without running GEMM1."""
+        from flashinfer import mxfp8_quantize
+        from flashinfer.fused_moe.cute_dsl.blockscaled_contiguous_grouped_gemm_finalize_fusion import (
+            blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4,
+        )
+
+        torch.manual_seed(20260703)
+        device = torch.device("cuda")
+        num_tokens = 17
+        num_experts = 2
+        topk = 2
+        k = 128
+        tile_size = mma_tiler_mn[0]
+        permuted_m = num_experts * tile_size
+
+        intermediate_bf16 = (
+            torch.randn(permuted_m, k, dtype=torch.bfloat16, device=device) / 2
+        )
+        intermediate, intermediate_sf = mxfp8_quantize(
+            intermediate_bf16, is_sf_swizzled_layout=True
+        )
+        intermediate_dequant, _ = _dequantize_mxfp8_swizzled(
+            intermediate, intermediate_sf
+        )
+
+        permuted_idx_to_expanded_idx = torch.full(
+            (permuted_m,), -1, dtype=torch.int32, device=device
+        )
+        expanded_token_ids = torch.arange(num_tokens, dtype=torch.int32, device=device)
+        for expert_idx in range(num_experts):
+            start = expert_idx * tile_size
+            permuted_idx_to_expanded_idx[start : start + num_tokens] = (
+                expanded_token_ids * topk + expert_idx
+            )
+        tile_idx_to_expert_idx = torch.arange(
+            num_experts, dtype=torch.int32, device=device
+        )
+        tile_idx_to_mn_limit = torch.tensor(
+            [expert_idx * tile_size + num_tokens for expert_idx in range(num_experts)],
+            dtype=torch.int32,
+            device=device,
+        )
+        num_non_exiting_tiles = torch.tensor(
+            [num_experts], dtype=torch.int32, device=device
+        )
+        token_final_scales = (
+            torch.tensor([0.4, 0.6], dtype=torch.float32, device=device)
+            .expand(num_tokens, topk)
+            .contiguous()
+        )
+
+        weights = (
+            torch.randn(num_experts, n, k, dtype=torch.bfloat16, device=device) / 4
+        )
+        weights_packed, weights_sf, weights_dequant = _quantize_mxfp4_grouped(weights)
+        alpha = torch.ones(num_experts, dtype=torch.float32, device=device)
+
+        output = blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
+            a=intermediate,
+            b=weights_packed,
+            a_scale=intermediate_sf,
+            b_scale=weights_sf,
+            alpha=alpha,
+            tile_idx_to_expert_idx=tile_idx_to_expert_idx,
+            num_non_exiting_tiles=num_non_exiting_tiles,
+            tile_idx_to_mn_limit=tile_idx_to_mn_limit,
+            permuted_idx_to_expanded_idx=permuted_idx_to_expanded_idx,
+            token_final_scales=token_final_scales,
+            mma_tiler_mn=mma_tiler_mn,
+            cluster_shape_mn=cluster_shape_mn,
+            enable_pdl=False,
+        )
+
+        valid_rows = torch.cat(
+            [
+                torch.arange(
+                    expert_idx * tile_size,
+                    expert_idx * tile_size + num_tokens,
+                    device=device,
+                )
+                for expert_idx in range(num_experts)
+            ]
+        )
+        expanded_idx = permuted_idx_to_expanded_idx[valid_rows].long()
+        token_ids = torch.div(expanded_idx, topk, rounding_mode="floor")
+        topk_ids = expanded_idx % topk
+        expert_ids = topk_ids
+        assert torch.equal(
+            tile_idx_to_expert_idx[valid_rows // tile_size].long(), expert_ids
+        )
+
+        gemm2_reference = torch.bmm(
+            weights_dequant[expert_ids],
+            intermediate_dequant[valid_rows].unsqueeze(-1),
+        ).squeeze(-1)
+        gemm2_reference *= token_final_scales[token_ids, topk_ids].unsqueeze(-1)
+        final_reference = torch.zeros(num_tokens, n, dtype=torch.float32, device=device)
+        final_reference.index_add_(0, token_ids, gemm2_reference)
+
+        assert output.shape == (num_tokens, n)
+        assert output.dtype is torch.bfloat16
+        _assert_numerically_close(
+            output,
+            final_reference.to(torch.bfloat16),
+            min_cosine=0.97,
+            max_relative_l2=0.25,
+        )
+
     @pytest.mark.parametrize(
         "mma_tiler_mn,cluster_shape_mn,swiglu_alpha,swiglu_beta,swiglu_limit",
         [

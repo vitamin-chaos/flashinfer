@@ -660,7 +660,9 @@ def blockscaled_contiguous_grouped_gemm_finalize_fusion_mxfp8_mxfp4(
 
     ``a`` contains E4M3 values, while ``b`` contains two packed E2M1 values
     per byte. Both scale tensors use the MMA-compatible E8M0 block-32 layout.
-    The finalized scatter-reduced output is BF16.
+    The finalized scatter-reduced output is BF16. The problem N dimension must
+    be divisible by 128 and by ``mma_tiler_mn[1]`` because the current finalize
+    epilogue does not predicate a partial N tile.
     """
     if a.ndim != 2 or b.ndim != 3:
         raise ValueError(f"Expected A rank 2 and B rank 3, got {a.ndim} and {b.ndim}")

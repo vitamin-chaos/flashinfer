@@ -341,6 +341,9 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
     :note: Constraints:
         - MMA tiler M must be 128 or 256 (use_2cta_instrs)
         - MMA tiler N must be 64/128/192/256
+        - Problem N must be divisible by both 128 (the scale-factor layout
+          atom) and the MMA N tile (the finalize epilogue currently has no
+          partial-N bulk-reduce path)
         - Cluster shape M must be multiple of 2 if Mma tiler M is 256
         - Cluster shape M/N must be positive and power of 2, total cluster size <= 16
         - Also, Cluster shape M/N must be <= 4 for scale factor multicasts due to limited size of scale factors
@@ -2648,6 +2651,14 @@ class Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel:
             or not check_contigous_16B_alignment(b_dtype, b_major == "n", (n, k, l))
             or not check_contigous_16B_alignment(out_dtype, out_major == "m", (m, n, l))
         ):
+            return False
+
+        tile_n = mma_tiler_mn[1]
+        if tile_n <= 0 or n % 128 != 0 or n % tile_n != 0:
+            # The wrapper exposes B scales in complete 128-row layout atoms,
+            # while the finalize epilogue bulk-reduces a complete N tile with
+            # no column-tail predicate. Reject configurations that would
+            # under-describe B scales or write beyond the final output row.
             return False
 
         needs_unpack = (
