@@ -471,7 +471,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
             )
 
             gemm1_ok = BlockScaledContiguousGatherGroupedGemmKernel.can_implement(
-                ab_dtype=ab_dtype,
+                a_dtype=ab_dtype,
+                b_dtype=ab_dtype,
                 sf_dtype=sf_dtype,
                 sf_vec_size=sf_vec_size,
                 c_dtype=gemm1_c_dtype,
@@ -488,7 +489,8 @@ class CuteDslFusedMoENvfp4Runner(TunableRunner):
 
             gemm2_ok = (
                 Sm100BlockScaledContiguousGroupedGemmFinalizeFusionKernel.can_implement(
-                    ab_dtype=ab_dtype,
+                    a_dtype=ab_dtype,
+                    b_dtype=ab_dtype,
                     sf_dtype=sf_dtype,
                     sf_vec_size=sf_vec_size,
                     out_dtype=gemm2_out_dtype,
